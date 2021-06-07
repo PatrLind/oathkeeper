@@ -2,20 +2,26 @@ package authn
 
 import (
 	"context"
+	"crypto/md5"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dgraph-io/ristretto"
+
+	"github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go/ext"
 
 	"github.com/pkg/errors"
 	"golang.org/x/oauth2/clientcredentials"
 
 	"github.com/ory/go-convenience/stringslice"
 	"github.com/ory/x/httpx"
+	"github.com/ory/x/logrusx"
 
 	"github.com/ory/oathkeeper/driver/configuration"
 	"github.com/ory/oathkeeper/helper"
@@ -39,6 +45,7 @@ type AuthenticatorOAuth2IntrospectionPreAuthConfiguration struct {
 	Enabled      bool     `json:"enabled"`
 	ClientID     string   `json:"client_id"`
 	ClientSecret string   `json:"client_secret"`
+	Audience     string   `json:"audience"`
 	Scope        []string `json:"scope"`
 	TokenURL     string   `json:"token_url"`
 }
@@ -51,28 +58,22 @@ type AuthenticatorOAuth2IntrospectionRetryConfiguration struct {
 type cacheConfig struct {
 	Enabled bool   `json:"enabled"`
 	TTL     string `json:"ttl"`
+	MaxCost int    `json:"max_cost"`
 }
 
 type AuthenticatorOAuth2Introspection struct {
 	c configuration.Provider
 
-	client *http.Client
+	clientMap map[string]*http.Client
+	mu        sync.RWMutex
 
 	tokenCache *ristretto.Cache
 	cacheTTL   *time.Duration
+	logger     *logrusx.Logger
 }
 
-func NewAuthenticatorOAuth2Introspection(c configuration.Provider) *AuthenticatorOAuth2Introspection {
-	var rt http.RoundTripper
-	cache, _ := ristretto.NewCache(&ristretto.Config{
-		// This will hold about 1000 unique mutation responses.
-		NumCounters: 10000,
-		// Allocate a max of 32MB
-		MaxCost: 1 << 25,
-		// This is a best-practice value.
-		BufferItems: 64,
-	})
-	return &AuthenticatorOAuth2Introspection{c: c, client: httpx.NewResilientClientLatencyToleranceSmall(rt), tokenCache: cache}
+func NewAuthenticatorOAuth2Introspection(c configuration.Provider, logger *logrusx.Logger) *AuthenticatorOAuth2Introspection {
+	return &AuthenticatorOAuth2Introspection{c: c, logger: logger, clientMap: make(map[string]*http.Client)}
 }
 
 func (a *AuthenticatorOAuth2Introspection) GetID() string {
@@ -119,14 +120,37 @@ func (a *AuthenticatorOAuth2Introspection) tokenToCache(config *AuthenticatorOAu
 	}
 
 	if a.cacheTTL != nil {
-		a.tokenCache.SetWithTTL(token, i, 0, *a.cacheTTL)
+		a.tokenCache.SetWithTTL(token, i, 1, *a.cacheTTL)
 	} else {
-		a.tokenCache.Set(token, i, 0)
+		a.tokenCache.Set(token, i, 1)
 	}
 }
 
+func (a *AuthenticatorOAuth2Introspection) traceRequest(ctx context.Context, req *http.Request) func() {
+	tracer := opentracing.GlobalTracer()
+	if tracer == nil {
+		return func() {}
+	}
+
+	parentSpan := opentracing.SpanFromContext(ctx)
+	opts := make([]opentracing.StartSpanOption, 0, 1)
+	if parentSpan != nil {
+		opts = append(opts, opentracing.ChildOf(parentSpan.Context()))
+	}
+
+	urlStr := req.URL.String()
+	clientSpan := tracer.StartSpan(req.Method+" "+urlStr, opts...)
+
+	ext.SpanKindRPCClient.Set(clientSpan)
+	ext.HTTPUrl.Set(clientSpan, urlStr)
+	ext.HTTPMethod.Set(clientSpan, req.Method)
+
+	tracer.Inject(clientSpan.Context(), opentracing.HTTPHeaders, opentracing.HTTPHeadersCarrier(req.Header))
+	return clientSpan.Finish
+}
+
 func (a *AuthenticatorOAuth2Introspection) Authenticate(r *http.Request, session *AuthenticationSession, config json.RawMessage, _ pipeline.Rule) error {
-	cf, err := a.Config(config)
+	cf, client, err := a.Config(config)
 	if err != nil {
 		return err
 	}
@@ -155,7 +179,14 @@ func (a *AuthenticatorOAuth2Introspection) Authenticate(r *http.Request, session
 		}
 		// set/override the content-type header
 		introspectReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		resp, err := a.client.Do(introspectReq)
+
+		// add tracing
+		closeSpan := a.traceRequest(r.Context(), introspectReq)
+
+		resp, err := client.Do(introspectReq.WithContext(r.Context()))
+
+		// close the span so it represents just the http request
+		closeSpan()
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -205,6 +236,10 @@ func (a *AuthenticatorOAuth2Introspection) Authenticate(r *http.Request, session
 		i.Extra["client_id"] = i.ClientID
 		i.Extra["scope"] = i.Scope
 
+		if len(i.Audience) != 0 {
+			i.Extra["aud"] = i.Audience
+		}
+
 		a.tokenToCache(cf, i, token)
 	}
 
@@ -219,57 +254,88 @@ func (a *AuthenticatorOAuth2Introspection) Validate(config json.RawMessage) erro
 		return NewErrAuthenticatorNotEnabled(a)
 	}
 
-	_, err := a.Config(config)
+	_, _, err := a.Config(config)
 	return err
 }
 
-func (a *AuthenticatorOAuth2Introspection) Config(config json.RawMessage) (*AuthenticatorOAuth2IntrospectionConfiguration, error) {
+func (a *AuthenticatorOAuth2Introspection) Config(config json.RawMessage) (*AuthenticatorOAuth2IntrospectionConfiguration, *http.Client, error) {
 	var c AuthenticatorOAuth2IntrospectionConfiguration
 	if err := a.c.AuthenticatorConfig(a.GetID(), config, &c); err != nil {
-		return nil, NewErrAuthenticatorMisconfigured(a, err)
+		return nil, nil, NewErrAuthenticatorMisconfigured(a, err)
 	}
 
-	var rt http.RoundTripper
+	clientKey := fmt.Sprintf("%x", md5.Sum([]byte(config)))
+	a.mu.RLock()
+	client, ok := a.clientMap[clientKey]
+	a.mu.RUnlock()
 
-	if c.PreAuth != nil && c.PreAuth.Enabled {
-		rt = (&clientcredentials.Config{
-			ClientID:     c.PreAuth.ClientID,
-			ClientSecret: c.PreAuth.ClientSecret,
-			Scopes:       c.PreAuth.Scope,
-			TokenURL:     c.PreAuth.TokenURL,
-		}).Client(context.Background()).Transport
-	}
+	if !ok {
+		a.logger.Debug("Initializing http client")
+		var rt http.RoundTripper
+		if c.PreAuth != nil && c.PreAuth.Enabled {
+			var ep url.Values
 
-	if c.Retry == nil {
-		c.Retry = &AuthenticatorOAuth2IntrospectionRetryConfiguration{Timeout: "500ms", MaxWait: "1s"}
-	} else {
-		if c.Retry.Timeout == "" {
-			c.Retry.Timeout = "500ms"
+			if c.PreAuth.Audience != "" {
+				ep = url.Values{"audience": {c.PreAuth.Audience}}
+			}
+
+			rt = (&clientcredentials.Config{
+				ClientID:       c.PreAuth.ClientID,
+				ClientSecret:   c.PreAuth.ClientSecret,
+				Scopes:         c.PreAuth.Scope,
+				EndpointParams: ep,
+				TokenURL:       c.PreAuth.TokenURL,
+			}).Client(context.Background()).Transport
 		}
-		if c.Retry.MaxWait == "" {
-			c.Retry.MaxWait = "1s"
+
+		if c.Retry == nil {
+			c.Retry = &AuthenticatorOAuth2IntrospectionRetryConfiguration{Timeout: "500ms", MaxWait: "1s"}
+		} else {
+			if c.Retry.Timeout == "" {
+				c.Retry.Timeout = "500ms"
+			}
+			if c.Retry.MaxWait == "" {
+				c.Retry.MaxWait = "1s"
+			}
 		}
-	}
-	duration, err := time.ParseDuration(c.Retry.Timeout)
-	if err != nil {
-		return nil, err
-	}
-	timeout := time.Millisecond * duration
+		duration, err := time.ParseDuration(c.Retry.Timeout)
+		if err != nil {
+			return nil, nil, err
+		}
+		timeout := time.Millisecond * duration
 
-	maxWait, err := time.ParseDuration(c.Retry.MaxWait)
-	if err != nil {
-		return nil, err
-	}
+		maxWait, err := time.ParseDuration(c.Retry.MaxWait)
+		if err != nil {
+			return nil, nil, err
+		}
 
-	a.client = httpx.NewResilientClientLatencyToleranceConfigurable(rt, timeout, maxWait)
+		client = httpx.NewResilientClientLatencyToleranceConfigurable(rt, timeout, maxWait)
+		a.mu.Lock()
+		a.clientMap[clientKey] = client
+		a.mu.Unlock()
+	}
 
 	if c.Cache.TTL != "" {
 		cacheTTL, err := time.ParseDuration(c.Cache.TTL)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		a.cacheTTL = &cacheTTL
 	}
 
-	return &c, nil
+	if a.tokenCache == nil {
+		a.logger.Debugf("Creating cache with max cost: %d", c.Cache.MaxCost)
+		cache, _ := ristretto.NewCache(&ristretto.Config{
+			// This will hold about 1000 unique mutation responses.
+			NumCounters: 10000,
+			// Allocate a max
+			MaxCost: int64(c.Cache.MaxCost),
+			// This is a best-practice value.
+			BufferItems: 64,
+		})
+
+		a.tokenCache = cache
+	}
+
+	return &c, client, nil
 }

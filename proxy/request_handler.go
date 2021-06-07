@@ -332,7 +332,7 @@ func (d *RequestHandler) HandleRequest(r *http.Request, rl *rule.Rule) (session 
 	return session, nil
 }
 
-// InitializeAuthnSession reates an authentication session and initializes it with a Match context if possible
+// InitializeAuthnSession creates an authentication session and initializes it with a Match context if possible
 func (d *RequestHandler) InitializeAuthnSession(r *http.Request, rl *rule.Rule) *authn.AuthenticationSession {
 
 	session := &authn.AuthenticationSession{
@@ -350,6 +350,8 @@ func (d *RequestHandler) InitializeAuthnSession(r *http.Request, rl *rule.Rule) 
 		session.MatchContext = authn.MatchContext{
 			RegexpCaptureGroups: values,
 			URL:                 r.URL,
+			Method:              r.Method,
+			Header:              r.Header,
 		}
 	}
 

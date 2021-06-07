@@ -52,7 +52,7 @@ func TestPipelineConfig(t *testing.T) {
 		p := setup(t)
 
 		require.NoError(t, p.PipelineConfig("authenticators", "oauth2_introspection", nil, &res))
-		assert.JSONEq(t, `{"cache":{"enabled":false},"introspection_url":"https://override/path","pre_authorization":{"client_id":"some_id","client_secret":"some_secret","enabled":true,"scope":["foo","bar"],"token_url":"https://my-website.com/oauth2/token"},"retry":{"max_delay":"100ms", "give_up_after":"1s"},"scope_strategy":"exact"}`, string(res), "%s", res)
+		assert.JSONEq(t, `{"cache":{"enabled":false, "max_cost":1000},"introspection_url":"https://override/path","pre_authorization":{"client_id":"some_id","client_secret":"some_secret","enabled":true,"audience":"some_audience","scope":["foo","bar"],"token_url":"https://my-website.com/oauth2/token"},"retry":{"max_delay":"100ms", "give_up_after":"1s"},"scope_strategy":"exact"}`, string(res), "%s", res)
 
 		// Cleanup
 		require.NoError(t, os.Setenv("AUTHENTICATORS_OAUTH2_INTROSPECTION_CONFIG_INTROSPECTION_URL", ""))
@@ -296,11 +296,11 @@ func TestViperProvider(t *testing.T) {
 		})
 
 		t.Run("authenticator=oauth2_introspection", func(t *testing.T) {
-			a := authn.NewAuthenticatorOAuth2Introspection(p)
+			a := authn.NewAuthenticatorOAuth2Introspection(p, logger)
 			assert.True(t, p.AuthenticatorIsEnabled(a.GetID()))
 			require.NoError(t, a.Validate(nil))
 
-			config, err := a.Config(nil)
+			config, _, err := a.Config(nil)
 			require.NoError(t, err)
 			assert.Equal(t, "https://my-website.com/oauth2/introspection", config.IntrospectionURL)
 			assert.Equal(t, "exact", config.ScopeStrategy)
@@ -308,6 +308,7 @@ func TestViperProvider(t *testing.T) {
 				ClientID:     "some_id",
 				ClientSecret: "some_secret",
 				TokenURL:     "https://my-website.com/oauth2/token",
+				Audience:     "some_audience",
 				Scope:        []string{"foo", "bar"},
 				Enabled:      true,
 			}, config.PreAuth)
@@ -430,9 +431,9 @@ func TestAuthenticatorOAuth2TokenIntrospectionPreAuthorization(t *testing.T) {
 		{enabled: true, id: "a", secret: "b", turl: "https://some-url", err: false},
 	} {
 		t.Run(fmt.Sprintf("case=%d", k), func(t *testing.T) {
-			a := authn.NewAuthenticatorOAuth2Introspection(v)
+			a := authn.NewAuthenticatorOAuth2Introspection(v, logrusx.New("", ""))
 
-			config, err := a.Config(json.RawMessage(fmt.Sprintf(`{
+			config, _, err := a.Config(json.RawMessage(fmt.Sprintf(`{
 	"pre_authorization": {
 		"enabled": %v,
 		"client_id": "%v",

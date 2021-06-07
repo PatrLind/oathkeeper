@@ -36,6 +36,7 @@ import (
 	"github.com/ory/oathkeeper/internal"
 	. "github.com/ory/oathkeeper/pipeline/authn"
 	"github.com/ory/viper"
+	"github.com/ory/x/logrusx"
 )
 
 func TestAuthenticatorOAuth2Introspection(t *testing.T) {
@@ -474,6 +475,75 @@ func TestAuthenticatorOAuth2Introspection(t *testing.T) {
 				},
 				expectErr: false,
 			},
+			{
+				d:      "should pass because audience and scopes match configuration",
+				r:      &http.Request{Header: http.Header{"Authorization": {"bearer token"}}},
+				config: []byte(`{ "pre_authorization":{"client_id":"some_id","client_secret":"some_secret","enabled":true,"scope":["foo","bar"]} }`),
+				setup: func(t *testing.T, m *httprouter.Router) {
+					m.POST("/oauth2/token", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+						require.NoError(t, r.ParseForm())
+						require.Equal(t, "", r.Form.Get("audience"))
+						require.Equal(t, "foo bar", r.Form.Get("scope"))
+						w.Header().Set("Content-type", "application/json; charset=us-ascii")
+						require.NoError(t, json.NewEncoder(w).Encode(&map[string]interface{}{"access_token": "foo-token"}))
+					})
+					m.POST("/oauth2/introspect", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+						require.NoError(t, r.ParseForm())
+						require.Equal(t, "token", r.Form.Get("token"))
+						require.Equal(t, "Bearer foo-token", r.Header.Get("authorization"))
+						require.NoError(t, json.NewEncoder(w).Encode(&AuthenticatorOAuth2IntrospectionResult{
+							Active: true,
+						}))
+					})
+				},
+				expectErr: false,
+			},
+			{
+				d:      "should pass because audience and scopes match configuration",
+				r:      &http.Request{Header: http.Header{"Authorization": {"bearer token"}}},
+				config: []byte(`{ "pre_authorization":{"client_id":"some_id","client_secret":"some_secret","enabled":true,"scope":["foo","bar"]} }`),
+				setup: func(t *testing.T, m *httprouter.Router) {
+					m.POST("/oauth2/token", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+						require.NoError(t, r.ParseForm())
+						require.Equal(t, "", r.Form.Get("audience"))
+						require.Equal(t, "foo bar", r.Form.Get("scope"))
+						w.Header().Set("Content-type", "application/json; charset=us-ascii")
+						require.NoError(t, json.NewEncoder(w).Encode(&map[string]interface{}{"access_token": "foo-token"}))
+					})
+					m.POST("/oauth2/introspect", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+						require.NoError(t, r.ParseForm())
+						require.Equal(t, "token", r.Form.Get("token"))
+						require.Equal(t, "Bearer foo-token", r.Header.Get("authorization"))
+						require.NoError(t, json.NewEncoder(w).Encode(&AuthenticatorOAuth2IntrospectionResult{
+							Active: true,
+						}))
+					})
+				},
+				expectErr: false,
+			},
+			{
+				d:      "should pass because audience and scopes should not be requested",
+				r:      &http.Request{Header: http.Header{"Authorization": {"bearer token"}}},
+				config: []byte(`{ "pre_authorization":{"client_id":"some_id","client_secret":"some_secret","enabled":true} }`),
+				setup: func(t *testing.T, m *httprouter.Router) {
+					m.POST("/oauth2/token", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+						require.NoError(t, r.ParseForm())
+						require.Equal(t, "", r.Form.Get("audience"))
+						require.Equal(t, "", r.Form.Get("scope"))
+						w.Header().Set("Content-type", "application/json; charset=us-ascii")
+						require.NoError(t, json.NewEncoder(w).Encode(&map[string]interface{}{"access_token": "foo-token"}))
+					})
+					m.POST("/oauth2/introspect", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+						require.NoError(t, r.ParseForm())
+						require.Equal(t, "token", r.Form.Get("token"))
+						require.Equal(t, "Bearer foo-token", r.Header.Get("authorization"))
+						require.NoError(t, json.NewEncoder(w).Encode(&AuthenticatorOAuth2IntrospectionResult{
+							Active: true,
+						}))
+					})
+				},
+				expectErr: false,
+			},
 		} {
 			t.Run(fmt.Sprintf("case=%d/description=%s", k, tc.d), func(t *testing.T) {
 				router := httprouter.New()
@@ -484,8 +554,10 @@ func TestAuthenticatorOAuth2Introspection(t *testing.T) {
 				defer ts.Close()
 
 				tc.config, _ = sjson.SetBytes(tc.config, "introspection_url", ts.URL+"/oauth2/introspect")
+				tc.config, _ = sjson.SetBytes(tc.config, "pre_authorization.token_url", ts.URL+"/oauth2/token")
+
 				sess := new(AuthenticationSession)
-				err := a.Authenticate(tc.r, sess, tc.config, nil)
+				err = a.Authenticate(tc.r, sess, tc.config, nil)
 				if tc.expectErr {
 					require.Error(t, err)
 					if tc.expectExactErr != nil {
@@ -517,5 +589,62 @@ func TestAuthenticatorOAuth2Introspection(t *testing.T) {
 		viper.Reset()
 		viper.Set(configuration.ViperKeyAuthenticatorOAuth2TokenIntrospectionIsEnabled, true)
 		require.Error(t, a.Validate(json.RawMessage(`{"introspection_url":"/oauth2/token"}`)))
+	})
+
+	t.Run("method=config", func(t *testing.T) {
+		logger := logrusx.New("test", "1")
+		authenticator := NewAuthenticatorOAuth2Introspection(conf, logger)
+
+		noPreauthConfig := []byte(`{ "introspection_url":"http://localhost/oauth2/token" }`)
+		preAuthConfigOne := []byte(`{ "introspection_url":"http://localhost/oauth2/token","pre_authorization":{"token_url":"http://localhost/oauth2/token","client_id":"some_id","client_secret":"some_secret","enabled":true} }`)
+		preAuthConfigTwo := []byte(`{ "introspection_url":"http://localhost/oauth2/token2","pre_authorization":{"token_url":"http://localhost/oauth2/token2","client_id":"some_id2","client_secret":"some_secret2","enabled":true} }`)
+
+		_, noPreauthClient, err := authenticator.Config(noPreauthConfig)
+		if err != nil {
+			require.NoError(t, err)
+		}
+
+		_, preauthOneClient, err := authenticator.Config(preAuthConfigOne)
+		if err != nil {
+			require.NoError(t, err)
+		}
+
+		_, preauthTwoClient, err := authenticator.Config(preAuthConfigTwo)
+		if err != nil {
+			require.NoError(t, err)
+		}
+
+		require.NotEqual(t, noPreauthClient, preauthOneClient)
+		require.NotEqual(t, noPreauthClient, preauthTwoClient)
+		require.NotEqual(t, preauthOneClient, preauthTwoClient)
+
+		_, preauthOneClient2, err := authenticator.Config(preAuthConfigOne)
+		if err != nil {
+			require.NoError(t, err)
+		}
+		if preauthOneClient2 != preauthOneClient {
+			t.FailNow()
+		}
+
+		_, preauthTwoClient2, err := authenticator.Config(preAuthConfigTwo)
+		if err != nil {
+			require.NoError(t, err)
+		}
+		if preauthTwoClient2 != preauthTwoClient {
+			t.FailNow()
+		}
+
+		_, noPreauthClient2, err := authenticator.Config(noPreauthConfig)
+		if err != nil {
+			require.NoError(t, err)
+		}
+		if noPreauthClient2 != noPreauthClient {
+			t.FailNow()
+		}
+
+		require.NotEqual(t, noPreauthClient, preauthOneClient)
+		require.NotEqual(t, noPreauthClient, preauthTwoClient)
+		require.NotEqual(t, preauthOneClient, preauthTwoClient)
+
 	})
 }

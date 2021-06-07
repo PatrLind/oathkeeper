@@ -1,8 +1,13 @@
 :root {
-  --ifm-color-primary: #6274f3;
+  --ifm-color-primary: #5528ff;
 }
 
 .markdown figure {
   padding: 8px;
   margin: 32px;
+}
+
+.menu__link[href*="https://"]:after
+{
+  display: none !important;
 }
