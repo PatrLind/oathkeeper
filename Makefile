@@ -55,6 +55,17 @@ install-stable: .bin/packr2
 		packr2 clean
 		git checkout master
 
+.PHONY: install-latency-fix
+install-latency-fix: .bin/packr2
+		OATHKEEPER_LATEST=$$(git describe --abbrev=0 --tags)
+		git checkout $$OATHKEEPER_LATEST
+		packr2
+		GO111MODULE=on go install \
+				-ldflags "-X github.com/ory/oathkeeper/x.Version=$$OATHKEEPER_LATEST -X github.com/ory/oathkeeper/x.Date=`TZ=UTC date -u '+%Y-%m-%dT%H:%M:%SZ'` -X github.com/ory/oathkeeper/x.Commit=`git rev-parse HEAD`" \
+				.
+		packr2 clean
+		git checkout latency-fix
+
 .PHONY: install
 install: .bin/packr2
 		packr2 || (GO111MODULE=on go install github.com/gobuffalo/packr/v2/packr2 && packr2)
