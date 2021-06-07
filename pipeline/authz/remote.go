@@ -38,7 +38,7 @@ type AuthorizerRemote struct {
 func NewAuthorizerRemote(c configuration.Provider) *AuthorizerRemote {
 	return &AuthorizerRemote{
 		c:      c,
-		client: httpx.NewResilientClientLatencyToleranceSmall(nil),
+		client: httpx.NewResilientClientLatencyToleranceHigh(nil),
 		t:      x.NewTemplate("remote"),
 	}
 }

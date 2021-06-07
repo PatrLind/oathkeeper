@@ -107,7 +107,7 @@ func NewMutatorHydrator(c configuration.Provider, d mutatorHydratorDependencies)
 		// This is a best-practice value.
 		BufferItems: 64,
 	})
-	return &MutatorHydrator{c: c, d: d, client: httpx.NewResilientClientLatencyToleranceSmall(nil), hydrateCache: cache}
+	return &MutatorHydrator{c: c, d: d, client: httpx.NewResilientClientLatencyToleranceHigh(nil), hydrateCache: cache}
 }
 
 func (a *MutatorHydrator) GetID() string {
